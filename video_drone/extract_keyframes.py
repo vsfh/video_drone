@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -59,18 +60,19 @@ def read_video_meta(video_path: Path) -> tuple[float, int, int, int, float]:
 
 def should_keep(
     frame_idx: int,
-    fps: float,
     prev_kept_frame: int | None,
     uniform_step: int,
+    uniform_origin_frame: int,
     score: float,
     scene_threshold: float,
     min_gap_frames: int,
 ) -> tuple[bool, str]:
-    if frame_idx == 0:
+    if prev_kept_frame is None:
         return True, "first"
 
     enough_gap = prev_kept_frame is None or (frame_idx - prev_kept_frame) >= min_gap_frames
-    if uniform_step > 0 and frame_idx % uniform_step == 0 and enough_gap:
+    uniform_offset = frame_idx - uniform_origin_frame
+    if uniform_step > 0 and uniform_offset >= 0 and uniform_offset % uniform_step == 0 and enough_gap:
         return True, "uniform"
     if score >= scene_threshold and enough_gap:
         return True, "scene_change"
@@ -79,6 +81,12 @@ def should_keep(
 
 def frame_brightness(gray: np.ndarray) -> float:
     return float(gray.mean())
+
+
+def frame_index_at_or_after(timestamp_sec: float, fps: float) -> int:
+    if fps <= 0:
+        return 0
+    return max(int(math.ceil(max(timestamp_sec, 0.0) * fps - 1e-9)), 0)
 
 
 def extract_for_video(
@@ -98,6 +106,7 @@ def extract_for_video(
 
     uniform_step = max(int(round(fps / sample_fps)), 1) if sample_fps > 0 else 0
     min_gap_frames = max(int(round(min_gap_sec * fps)), 1)
+    start_frame = frame_index_at_or_after(skip_start_sec, fps)
 
     event_name = event_name or video_path.parent.name
     video_stem = safe_name(video_path.stem)
@@ -116,10 +125,10 @@ def extract_for_video(
         elif frame.shape[-1] == 4:
             frame = frame[:, :, :3]
         timestamp_sec = frame_idx / fps if fps else 0.0
-        if timestamp_sec < skip_start_sec:
+        if frame_idx < start_frame:
             frame_idx += 1
             continue
-        if skip_end_sec > 0 and duration_sec > 0 and timestamp_sec > max(duration_sec - skip_end_sec, skip_start_sec):
+        if skip_end_sec > 0 and duration_sec > 0 and timestamp_sec >= duration_sec - skip_end_sec - 1e-9:
             break
 
         gray = small_gray(frame)
@@ -131,9 +140,9 @@ def extract_for_video(
         score = frame_score(prev_gray, gray)
         keep, reason = should_keep(
             frame_idx=frame_idx,
-            fps=fps,
             prev_kept_frame=prev_kept_frame,
             uniform_step=uniform_step,
+            uniform_origin_frame=start_frame,
             score=score,
             scene_threshold=scene_threshold,
             min_gap_frames=min_gap_frames,
