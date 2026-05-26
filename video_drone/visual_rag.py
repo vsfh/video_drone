@@ -4,7 +4,7 @@ import argparse
 import csv
 import html
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -39,6 +39,9 @@ class EvidenceExample:
     event: str
     path: Path
     relative_path: str
+    crop_path: Path | None = None
+    crop_relative_path: str = ""
+    red_box_found: bool = False
 
 
 class ImageEmbedder(Protocol):
@@ -48,6 +51,113 @@ class ImageEmbedder(Protocol):
 
 def _safe_rel_id(path: Path, root: Path) -> str:
     return str(path.relative_to(root)).replace("\\", "/")
+
+
+def evidence_image_path(example: EvidenceExample) -> Path:
+    return example.crop_path if example.crop_path is not None else example.path
+
+
+def evidence_relative_path(example: EvidenceExample) -> str:
+    return example.crop_relative_path or example.relative_path
+
+
+def _red_pixel_mask(image: Image.Image) -> np.ndarray:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+    red = rgb[:, :, 0]
+    green = rgb[:, :, 1]
+    blue = rgb[:, :, 2]
+    return (red >= 150) & (green <= 110) & (blue <= 110) & ((red - green) >= 60) & ((red - blue) >= 60)
+
+
+def _component_bboxes(mask: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+    height, width = mask.shape
+    visited = np.zeros(mask.shape, dtype=bool)
+    bboxes: list[tuple[int, int, int, int, int]] = []
+    ys, xs = np.nonzero(mask)
+    for seed_y, seed_x in zip(ys.tolist(), xs.tolist()):
+        if visited[seed_y, seed_x]:
+            continue
+        stack = [(seed_x, seed_y)]
+        visited[seed_y, seed_x] = True
+        min_x = max_x = seed_x
+        min_y = max_y = seed_y
+        count = 0
+        while stack:
+            x, y = stack.pop()
+            count += 1
+            min_x = min(min_x, x)
+            max_x = max(max_x, x)
+            min_y = min(min_y, y)
+            max_y = max(max_y, y)
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                    continue
+                if visited[ny, nx] or not mask[ny, nx]:
+                    continue
+                visited[ny, nx] = True
+                stack.append((nx, ny))
+        bboxes.append((min_x, min_y, max_x, max_y, count))
+    return bboxes
+
+
+def detect_red_box_bbox(image_path: Path, min_red_pixels: int = 20) -> tuple[int, int, int, int] | None:
+    with Image.open(image_path) as image:
+        mask = _red_pixel_mask(image)
+    candidates = []
+    for min_x, min_y, max_x, max_y, count in _component_bboxes(mask):
+        box_w = max_x - min_x + 1
+        box_h = max_y - min_y + 1
+        if count < min_red_pixels or box_w < 4 or box_h < 4:
+            continue
+        candidates.append((min_x, min_y, max_x, max_y, count))
+    if not candidates:
+        return None
+    min_x, min_y, max_x, max_y, _count = max(candidates, key=lambda item: ((item[2] - item[0] + 1) * (item[3] - item[1] + 1), item[4]))
+    return (min_x, min_y, max_x, max_y)
+
+
+def _crop_inner_red_box(src: Path, dst: Path, bbox: tuple[int, int, int, int], inset: int) -> None:
+    left, top, right, bottom = bbox
+    crop_box = (left + inset, top + inset, right - inset + 1, bottom - inset + 1)
+    if crop_box[0] >= crop_box[2] or crop_box[1] >= crop_box[3]:
+        crop_box = (left, top, right + 1, bottom + 1)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(src) as image:
+        image.convert("RGB").crop(crop_box).save(dst)
+
+
+def prepare_evidence_examples(
+    examples: list[EvidenceExample],
+    crop_root: Path,
+    red_box_mode: str = "auto",
+    red_box_inset: int = 2,
+) -> list[EvidenceExample]:
+    if red_box_mode == "off":
+        return examples
+    if red_box_mode not in {"auto", "require"}:
+        raise ValueError(f"Unsupported red_box_mode: {red_box_mode}")
+
+    prepared: list[EvidenceExample] = []
+    crop_root = crop_root.resolve()
+    for example in examples:
+        bbox = detect_red_box_bbox(example.path)
+        if bbox is None:
+            if red_box_mode == "auto":
+                prepared.append(example)
+            continue
+        rel_base = Path(example.relative_path)
+        crop_rel = str(rel_base.with_name(f"{rel_base.stem}__redbox.png")).replace("\\", "/")
+        crop_path = crop_root / crop_rel
+        _crop_inner_red_box(example.path, crop_path, bbox, red_box_inset)
+        prepared.append(
+            replace(
+                example,
+                crop_path=crop_path,
+                crop_relative_path=f"redbox_crops/{crop_rel}",
+                red_box_found=True,
+            )
+        )
+    return prepared
 
 
 def _manifest_example_paths(examples_root: Path) -> list[tuple[str, Path, str]]:
@@ -236,8 +346,11 @@ def rank_event_candidates(
         if len(bucket["examples"]) < examples_per_event:
             bucket["examples"].append(
                 {
-                    "relative_path": example.relative_path,
-                    "source_path": str(example.path),
+                    "relative_path": evidence_relative_path(example),
+                    "source_path": str(evidence_image_path(example)),
+                    "original_relative_path": example.relative_path,
+                    "original_source_path": str(example.path),
+                    "red_box_found": example.red_box_found,
                     "score": score,
                 }
             )
@@ -270,6 +383,7 @@ def build_visual_rag_prompt(event_rows: list[dict], candidates: list[dict], top_
 
 任务:
 - 只判断最后一张待测图像，不要把示例图中的事件当作待测结果。
+- 如果示例图来自红框裁剪，裁剪图就是原示意图红框内部的关键 object / region；如果仍是原图，也只有红框内部代表事件，红框外背景不是事件证据。
 - 候选事件来自视觉 RAG 检索，可能不是固定 9 类，未来可以继续扩展。
 - 每个事件的 score 是独立相关性，范围 0 到 1，不要求总和为 1，也不要为了归一化压低其他事件。
 - 如果多个事件都明显成立，可以同时给较高分；如果都不成立，可以全部给低分。
@@ -281,6 +395,7 @@ def build_visual_rag_prompt(event_rows: list[dict], candidates: list[dict], top_
 - 只输出一个 JSON 对象，不要输出 Markdown、解释性前后缀或代码块。
 - events 最多返回 {top_k} 个，按独立相关性 score 从高到低排序。
 - evidence 用一句中文说明最后一张待测图像中支持该事件的关键视觉证据。
+- 不要因为背景、拍摄角度、农田、水面、道路、屋顶颜色相似就输出事件；必须能在待测图中看到与示例红框内部对应的关键 object / region。
 - caption 用一句中文概括最后一张待测图像。
 
 JSON 格式:
@@ -424,7 +539,7 @@ def _candidate_examples(candidates: list[dict]) -> list[EvidenceExample]:
             if not src or src in seen:
                 continue
             seen.add(src)
-            output.append(EvidenceExample(event=event, path=Path(src), relative_path=rel))
+            output.append(EvidenceExample(event=event, path=Path(src), relative_path=rel, red_box_found=bool(item.get("red_box_found"))))
     return output
 
 
@@ -434,13 +549,25 @@ def build_qwen_visual_rag_messages(
     prompt: str,
     max_pixels: int | None,
 ) -> list[dict[str, Any]]:
-    content: list[dict[str, Any]] = [{"type": "text", "text": "下面是视觉 RAG 检索到的标准示例图片。每张示例后说明其事件类别。"}]
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": "下面是视觉 RAG 检索到的标准示例图片。优先使用原示意图的红框裁剪；红框内部才是事件关键目标，红框外背景不代表事件。",
+        }
+    ]
     for idx, example in enumerate(examples, 1):
-        image_item: dict[str, Any] = {"type": "image", "image": str(example.path.resolve())}
+        image_path = evidence_image_path(example)
+        image_item: dict[str, Any] = {"type": "image", "image": str(image_path.resolve())}
         if max_pixels is not None and max_pixels > 0:
             image_item["max_pixels"] = max_pixels
         content.append(image_item)
-        content.append({"type": "text", "text": f"检索示例 {idx}: 事件类别 = {example.event}。示例来源: {example.relative_path}"})
+        source_note = "红框裁剪" if example.red_box_found else "原图，只有红框内部代表事件"
+        content.append(
+            {
+                "type": "text",
+                "text": f"检索示例 {idx}: 事件类别 = {example.event}。示例来源: {evidence_relative_path(example)}。证据类型: {source_note}",
+            }
+        )
     target_item: dict[str, Any] = {"type": "image", "image": str(target_image_path.resolve())}
     if max_pixels is not None and max_pixels > 0:
         target_item["max_pixels"] = max_pixels
@@ -505,7 +632,7 @@ class QwenVisualRagVerifier:
 
 
 def build_evidence_index(embedder: ImageEmbedder, examples: list[EvidenceExample]) -> np.ndarray:
-    return embedder.embed_image_paths([example.path for example in examples])
+    return embedder.embed_image_paths([evidence_image_path(example) for example in examples])
 
 
 def predict_records_retrieve_only(
@@ -729,6 +856,8 @@ def main() -> None:
     parser.add_argument("--per-class-limit", default=None, type=int)
     parser.add_argument("--index-examples-per-event", default=None, type=int, help="Limit evidence images per event in the retrieval index. Defaults to all examples.")
     parser.add_argument("--examples-per-event", default=DEFAULT_EXAMPLES_PER_EVENT, type=int)
+    parser.add_argument("--red-box-mode", default="auto", choices=["auto", "off", "require"], help="Use red rectangle crops from exemplar images. auto falls back to full images when no box is found.")
+    parser.add_argument("--red-box-inset", default=2, type=int, help="Pixels to trim inward from the detected red rectangle before cropping.")
     parser.add_argument("--top-examples", default=DEFAULT_TOP_EXAMPLES, type=int)
     parser.add_argument("--candidate-events", default=DEFAULT_CANDIDATE_EVENTS, type=int)
     parser.add_argument("--top-k", default=DEFAULT_TOP_K, type=int)
@@ -746,6 +875,9 @@ def main() -> None:
     examples = load_evidence_examples(args.examples_root, requested_events, args.index_examples_per_event)
     if not examples:
         raise RuntimeError(f"No evidence examples found under {args.examples_root}")
+    examples = prepare_evidence_examples(examples, args.out_dir / "redbox_crops", args.red_box_mode, args.red_box_inset)
+    if not examples:
+        raise RuntimeError(f"No evidence examples remained after red-box preparation under {args.examples_root}")
     event_names = requested_events if requested_events is not None else unique_events_from_examples(examples)
     event_names = [event for event in event_names if any(example.event == event for example in examples)]
     event_rows = event_rows_for_names(event_names)
