@@ -35,7 +35,8 @@ python -m video_drone.auto \
   --output result.json \
   --shots-per-class 1 \
   --class-chunk-size 12 \
-  --max-pixels 262144
+  --max-pixels 262144 \
+  --progress auto
 
 Evaluation command:
 python -m video_drone.test \

@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Sequence, TextIO
 
 from PIL import Image
 
@@ -16,6 +17,7 @@ DEFAULT_MODEL_ID = "/media/data1/feihong/hf_cache/models--Qwen--Qwen3-VL-4B-Inst
 DEFAULT_SHOTS_PER_CLASS = 3
 DEFAULT_CLASS_CHUNK_SIZE = 4
 DEFAULT_MAX_PIXELS = 262144
+DEFAULT_PROGRESS = "auto"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 AUTO_RESEARCH_CHANGELOG = [
@@ -26,6 +28,10 @@ AUTO_RESEARCH_CHANGELOG = [
     {
         "time": "2026-06-03 12:30:00",
         "summary": "Force Qwen3-VL-4B loading from the local HuggingFace cache path with local_files_only=True.",
+    },
+    {
+        "time": "2026-06-03 13:10:00",
+        "summary": "Add sample and class-chunk progress reporting with tqdm/text/none modes.",
     }
 ]
 
@@ -131,6 +137,36 @@ def chunked(items: Sequence[str], chunk_size: int) -> Iterable[list[str]]:
         return
     for index in range(0, len(items), chunk_size):
         yield list(items[index : index + chunk_size])
+
+
+def _progress_write(stream: TextIO, message: str) -> None:
+    stream.write(message + "\n")
+    stream.flush()
+
+
+def _progress_mode(progress: str, stream: TextIO) -> str:
+    if progress not in {"auto", "tqdm", "text", "none"}:
+        raise ValueError("progress must be one of: auto, tqdm, text, none")
+    if progress == "none":
+        return "none"
+    if progress == "text":
+        return "text"
+    try:
+        import tqdm  # noqa: F401
+
+        return "tqdm"
+    except ImportError:
+        if progress == "tqdm":
+            _progress_write(stream, "[auto] tqdm is not installed; falling back to text progress")
+        return "text"
+
+
+def _progress_bar(items: Sequence[Any], mode: str, stream: TextIO, desc: str, unit: str):
+    if mode != "tqdm":
+        return items
+    from tqdm.auto import tqdm
+
+    return tqdm(items, total=len(items), desc=desc, unit=unit, file=stream, dynamic_ncols=True)
 
 
 def build_agent_prompt(classes: Sequence[str], examples_by_class: dict[str, list[FewShotImage]]) -> str:
@@ -373,20 +409,46 @@ def forward(
     class_chunk_size: int = DEFAULT_CLASS_CHUNK_SIZE,
     max_pixels: int = DEFAULT_MAX_PIXELS,
     limit: int | None = None,
+    progress: str = DEFAULT_PROGRESS,
+    progress_stream: TextIO | None = None,
 ) -> list[dict[str, Any]]:
+    progress_stream = progress_stream or sys.stderr
+    resolved_progress = _progress_mode(progress, progress_stream)
     dataset = build_dataset(
         data_root=data_root,
         shots_per_class=shots_per_class,
         example_subdir=example_subdir,
         target_subdir=target_subdir,
     )
+    if resolved_progress == "text":
+        _progress_write(
+            progress_stream,
+            (
+                f"[auto] dataset classes={len(dataset.classes)} "
+                f"examples={sum(len(items) for items in dataset.examples_by_class.values())} "
+                f"samples={len(dataset.samples if limit is None else dataset.samples[:limit])}"
+            ),
+        )
     predictor = predictor or QwenVlmPredictor(model_id=model_id)
     records: list[dict[str, Any]] = []
     samples = dataset.samples[:limit] if limit is not None else dataset.samples
+    class_chunks = list(chunked(dataset.classes, class_chunk_size))
 
-    for sample_index, sample in enumerate(samples, start=1):
+    sample_items = list(enumerate(samples, start=1))
+    for sample_index, sample in _progress_bar(sample_items, resolved_progress, progress_stream, "samples", "sample"):
+        if resolved_progress == "text":
+            _progress_write(
+                progress_stream,
+                f"[auto] sample {sample_index}/{len(samples)} {sample.relative_path}",
+            )
         parsed_chunks: list[dict[str, Any]] = []
-        for class_chunk in chunked(dataset.classes, class_chunk_size):
+        chunk_items = list(enumerate(class_chunks, start=1))
+        for chunk_index, class_chunk in chunk_items:
+            if resolved_progress == "text":
+                _progress_write(
+                    progress_stream,
+                    f"[auto] chunk {chunk_index}/{len(class_chunks)} classes={','.join(class_chunk)}",
+                )
             chunk_examples = {event: dataset.examples_by_class.get(event, []) for event in class_chunk}
             prompt = build_agent_prompt(class_chunk, chunk_examples)
             raw = predictor.predict(sample, chunk_examples, class_chunk, prompt, max_pixels)
@@ -424,6 +486,8 @@ def forward(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if resolved_progress == "text":
+        _progress_write(progress_stream, f"[auto] wrote result.json path={output_path}")
     return records
 
 
@@ -438,6 +502,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--class-chunk-size", type=int, default=DEFAULT_CLASS_CHUNK_SIZE)
     parser.add_argument("--max-pixels", type=int, default=DEFAULT_MAX_PIXELS)
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--progress", choices=["auto", "tqdm", "text", "none"], default=DEFAULT_PROGRESS)
     return parser.parse_args()
 
 
@@ -453,6 +518,7 @@ def main() -> None:
         class_chunk_size=args.class_chunk_size,
         max_pixels=args.max_pixels,
         limit=args.limit,
+        progress=args.progress,
     )
 
 
