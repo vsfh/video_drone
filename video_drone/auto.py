@@ -4,6 +4,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence, TextIO
@@ -32,6 +33,10 @@ AUTO_RESEARCH_CHANGELOG = [
     {
         "time": "2026-06-03 13:10:00",
         "summary": "Add sample and class-chunk progress reporting with tqdm/text/none modes.",
+    },
+    {
+        "time": "2026-06-03 13:35:00",
+        "summary": "Print per-chunk image loading/processor time and model forward generation time.",
     }
 ]
 
@@ -167,6 +172,13 @@ def _progress_bar(items: Sequence[Any], mode: str, stream: TextIO, desc: str, un
     from tqdm.auto import tqdm
 
     return tqdm(items, total=len(items), desc=desc, unit=unit, file=stream, dynamic_ncols=True)
+
+
+def _format_seconds(value: Any) -> str:
+    try:
+        return f"{float(value):.3f}s"
+    except (TypeError, ValueError):
+        return "n/a"
 
 
 def build_agent_prompt(classes: Sequence[str], examples_by_class: dict[str, list[FewShotImage]]) -> str:
@@ -307,6 +319,7 @@ class QwenVlmPredictor:
         self.model_id = model_id
         self.max_new_tokens = max_new_tokens
         self.model_path = resolve_local_model_path(model_id)
+        self.last_timing: dict[str, float] = {}
 
         import torch
         from transformers import AutoProcessor
@@ -344,6 +357,8 @@ class QwenVlmPredictor:
         prompt: str,
         max_pixels: int = DEFAULT_MAX_PIXELS,
     ) -> str:
+        total_start = time.perf_counter()
+        load_start = time.perf_counter()
         messages = build_vlm_messages(sample, examples_by_class, classes, prompt, max_pixels=max_pixels)
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -367,14 +382,22 @@ class QwenVlmPredictor:
             inputs = self.processor(text=[text], images=image_inputs, padding=True, return_tensors="pt")
 
         inputs = inputs.to(self._input_device())
+        image_load_seconds = time.perf_counter() - load_start
+        forward_start = time.perf_counter()
         with self.torch.inference_mode():
             generated_ids = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens)
+        forward_seconds = time.perf_counter() - forward_start
         generated_trimmed = [
             output_ids[len(input_ids) :] for input_ids, output_ids in zip(inputs.input_ids, generated_ids, strict=False)
         ]
         output = self.processor.batch_decode(generated_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         if self.torch.cuda.is_available():
             self.torch.cuda.empty_cache()
+        self.last_timing = {
+            "image_load_seconds": image_load_seconds,
+            "forward_seconds": forward_seconds,
+            "total_seconds": time.perf_counter() - total_start,
+        }
         return output
 
 
@@ -451,8 +474,25 @@ def forward(
                 )
             chunk_examples = {event: dataset.examples_by_class.get(event, []) for event in class_chunk}
             prompt = build_agent_prompt(class_chunk, chunk_examples)
+            predict_start = time.perf_counter()
             raw = predictor.predict(sample, chunk_examples, class_chunk, prompt, max_pixels)
-            parsed_chunks.append(parse_prediction_json(raw, class_chunk, default_event=None))
+            predict_total_seconds = time.perf_counter() - predict_start
+            timing = dict(getattr(predictor, "last_timing", {}) or {})
+            timing.setdefault("total_seconds", predict_total_seconds)
+            if resolved_progress != "none":
+                _progress_write(
+                    progress_stream,
+                    (
+                        f"[auto] timing sample={sample_index}/{len(samples)} "
+                        f"chunk={chunk_index}/{len(class_chunks)} "
+                        f"load_images={_format_seconds(timing.get('image_load_seconds'))} "
+                        f"forward={_format_seconds(timing.get('forward_seconds'))} "
+                        f"total={_format_seconds(timing.get('total_seconds'))}"
+                    ),
+                )
+            parsed = parse_prediction_json(raw, class_chunk, default_event=None)
+            parsed["timing"] = timing
+            parsed_chunks.append(parsed)
 
         merged = _merge_chunk_predictions(parsed_chunks, dataset.classes)
         records.append(
