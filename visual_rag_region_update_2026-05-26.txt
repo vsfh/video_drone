@@ -1,0 +1,167 @@
+修改时间: 2026-05-26 15:01:22 CST
+复查补充时间: 2026-05-26 15:01 后, 已追加 OOM 风险控制
+Qwen-only 补充时间: 2026-05-26 15:45:46 CST
+
+主题: Visual RAG 从整图检索改为 region-level 红框原型匹配
+
+改动概览
+1. 保留已有红框裁剪逻辑: 示例图中检测红框, 裁剪红框内部 object / region, 作为事件 prototype.
+2. 新增目标图 region proposal: 对待测图生成 full image + sliding-window tiles, 每个 region 单独做 embedding.
+3. 新增 region-to-prototype 匹配: 每个候选 region 与所有红框 prototype 比较, 不再只用整图背景相似度.
+4. 新增严格过滤:
+   - region-min-score: 事件 region 相似度下限.
+   - region-min-margin: top1 事件必须明显高于 runner-up 事件.
+   - region-min-example-hits: 同一事件必须命中多个红框示例, 避免单张示例误触发.
+5. 新增运行模式:
+   - region-retrieve: 只做 region 检索和严格过滤, 不加载 Qwen.
+   - region-verify: region 检索后, 对每个候选 region 用 Qwen 做单事件验证.
+6. summary.csv 增加 region 信息:
+   - retrieved_region
+   - retrieved_region_bbox
+7. OOM 风险控制:
+   - 新增 --max-regions-per-image, 默认最多 96 个 region, 防止大图小步长切出过多候选.
+   - verify / region-verify 模式下, 如果 --embed-device 保持 auto, 会自动用 CPU 跑 CLIP embedding, 给 Qwen 留 GPU 显存.
+8. 新增 Qwen-only 模式:
+   - --mode qwen-region-scan
+   - 强制跑 PRIMARY_EVENTS 9 类.
+   - 完全绕过 CLIP, 不加载 embedding model.
+   - 每类最多使用 --qwen-scan-examples-per-event 张红框示意图, 默认 5.
+   - 每张目标图最多扫描 --qwen-scan-max-regions 个候选 region, 默认 32.
+   - 每次 Qwen 调用只输入: 某一类的红框示例 crop + 1 张候选 region.
+   - 对没有同名示例的主类, 仍按文字定义扫描, 但 example_count 为 0.
+
+推荐运行命令
+
+轻量候选检索:
+python -m video_drone.visual_rag \
+  --mode region-retrieve \
+  --event-scope examples \
+  --red-box-mode auto \
+  --region-size 448 \
+  --region-stride 336 \
+  --region-min-score 0.82 \
+  --region-min-margin 0.04 \
+  --region-min-example-hits 2 \
+  --max-regions-per-image 96 \
+  --out-dir outputs/visual_rag_region_retrieve
+
+带 Qwen 单事件验证:
+python -m video_drone.visual_rag \
+  --mode region-verify \
+  --event-scope examples \
+  --red-box-mode auto \
+  --candidate-events 5 \
+  --examples-per-event 3 \
+  --region-size 448 \
+  --region-stride 336 \
+  --region-min-score 0.82 \
+  --region-min-margin 0.04 \
+  --region-min-example-hits 2 \
+  --max-regions-per-image 96 \
+  --threshold 0.35 \
+  --out-dir outputs/visual_rag_region_verify
+
+完全不用 CLIP 的 Qwen-only 9 类扫描:
+python -m video_drone.visual_rag \
+  --mode qwen-region-scan \
+  --red-box-mode auto \
+  --qwen-scan-max-regions 32 \
+  --qwen-scan-examples-per-event 5 \
+  --threshold 0.35 \
+  --out-dir outputs/qwen_region_scan_9class
+
+注意:
+- 当前示例库中 9 个主类里有 6 类有同名红框示意图:
+  在建农房, 流动摊贩, 消防通道占用, 烟雾排放, 疑似烟火, 附属房建材.
+- 垃圾集中点, 水面油污污染, 黑臭水体 当前没有同名示意图; qwen-region-scan 会按文字定义扫描这些类, 不会把其他类示意图冒充为它们的示例.
+- 理论调用次数约为: 图片数 * 9 * region数. 默认 32 region 时, 每张图最多约 288 次 Qwen 调用, 会明显慢于 CLIP/region-retrieve.
+
+关键代码片段
+
+1. 目标图 region proposal
+
+@dataclass(frozen=True)
+class RegionProposal:
+    path: Path
+    relative_path: str
+    bbox: tuple[int, int, int, int]
+
+
+def generate_region_proposals(
+    image_path: Path,
+    region_root: Path,
+    sample_id: str,
+    region_size: int,
+    region_stride: int,
+    include_full_image: bool,
+    max_regions: int | None = None,
+) -> list[RegionProposal]:
+    ...
+
+2. region-to-redbox-prototype 严格匹配
+
+def rank_region_event_candidates(
+    region_embeddings: np.ndarray,
+    regions: list[RegionProposal],
+    evidence_embeddings: np.ndarray,
+    examples: list[EvidenceExample],
+    top_examples: int,
+    top_events: int,
+    examples_per_event: int,
+    min_score: float,
+    min_margin: float,
+    min_example_hits: int,
+) -> list[dict]:
+    ...
+
+核心判断逻辑:
+- 对每个 region, 计算它和所有红框 prototype 的相似度.
+- 对每个事件, 取 top-k 示例命中.
+- 如果同一事件命中数量 < min_example_hits, 直接丢弃.
+- 如果 best_event_score < min_score, 直接丢弃.
+- 如果 best_event_score - runner_up_score < min_margin, 直接丢弃.
+- 最终每个事件只保留得分最高的 region.
+
+3. Qwen 单事件 region verifier prompt
+
+def build_region_verify_prompt(event_row: dict, candidate: dict) -> str:
+    event = candidate["event"]
+    return f"""你是无人机巡检图像的城市治理事件识别助手。输入中前面的图片是“{event}”的红框 object 示例，最后一张图片是从待测图像中裁剪出的候选区域。
+
+任务:
+- 只判断最后一张候选区域，不要判断整张原图，也不要把示例图里的事件当作结果。
+- 只有候选区域中清楚可见“{event}”的关键 object / region / 状态时，has_event 才能为 true。
+- 如果只是背景、颜色、道路、农田、水面、屋顶、拍摄角度相似，但缺少关键 object，必须判 false，score 不得超过 0.3。
+- 如果候选区域太模糊、太小、被遮挡、证据不足，必须判 false。
+..."""
+
+4. Qwen-only region scan prompt
+
+def build_qwen_region_scan_prompt(event_row: dict, example_count: int, region_bbox: tuple[int, int, int, int]) -> str:
+    event = event_row["event"]
+    return f"""你是无人机巡检图像的城市治理事件识别助手。输入中前面最多 {example_count} 张红框 object 示例是“{event}”的视觉标准，最后一张图片是从待测图像中裁剪出的候选区域。
+
+任务:
+- 只判断最后一张候选区域，不要判断整张原图，也不要把示例图里的事件当作结果。
+- 前面的示例图只用于理解“{event}”的关键 object / region / 状态；红框外背景不代表事件。
+- 只有候选区域中清楚可见与示例红框内部同类的关键 object / region / 状态时，has_event 才能为 true。
+- 如果只是背景、颜色、道路、农田、水面、屋顶、拍摄角度相似，但缺少关键 object，必须判 false，score 不得超过 0.3。
+..."""
+
+调参建议
+1. 误检多:
+   - 提高 --region-min-score, 例如 0.86.
+   - 提高 --region-min-margin, 例如 0.08.
+   - 提高 --region-min-example-hits, 例如 3.
+   - 使用 --mode region-verify.
+2. 漏检多:
+   - 降低 --region-min-score, 例如 0.78.
+   - 降低 --region-min-margin, 例如 0.02.
+   - 减小 --region-size 或 --region-stride, 增加候选区域密度.
+3. 显存紧:
+   - 先跑 --mode region-retrieve.
+   - 减小 --candidate-events 和 --examples-per-event.
+   - 降低 --max-regions-per-image, 例如 24 或 48.
+   - verify / region-verify 默认会把 CLIP embedding 放到 CPU; 如果手动指定 --embed-device cuda, 可能增加 Qwen OOM 风险.
+   - region-verify 只会把少量红框示例和候选 region 送入 Qwen, 比整图多图上下文更省.
+   - qwen-region-scan 不加载 CLIP, 但会做大量 Qwen 调用; 如果 OOM, 先降低 --qwen-scan-max-regions 到 8 或 16, 并降低 --max-pixels.
