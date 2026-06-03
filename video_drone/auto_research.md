@@ -34,6 +34,7 @@ python -m video_drone.auto \
   --data-root /media/data1/feihong/video_drone_data/photos_2025-05-30_2025-06-30 \
   --output result.json \
   --shots-per-class 1 \
+  --per-class-limit 5 \
   --class-chunk-size 12 \
   --max-pixels 262144 \
   --progress auto

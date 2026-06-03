@@ -16,6 +16,7 @@ DEFAULT_DATA_ROOT = Path("/media/data1/feihong/video_drone_data/photos_2025-05-3
 DEFAULT_OUTPUT_PATH = Path("result.json")
 DEFAULT_MODEL_ID = "/media/data1/feihong/hf_cache/models--Qwen--Qwen3-VL-4B-Instruct"
 DEFAULT_SHOTS_PER_CLASS = 3
+DEFAULT_PER_CLASS_LIMIT = 5
 DEFAULT_CLASS_CHUNK_SIZE = 4
 DEFAULT_MAX_PIXELS = 262144
 DEFAULT_PROGRESS = "auto"
@@ -37,6 +38,10 @@ AUTO_RESEARCH_CHANGELOG = [
     {
         "time": "2026-06-03 13:35:00",
         "summary": "Print per-chunk image loading/processor time and model forward generation time.",
+    },
+    {
+        "time": "2026-06-03 13:50:00",
+        "summary": "Limit inference to at most N target images per class, defaulting to 5.",
     }
 ]
 
@@ -106,6 +111,7 @@ def build_dataset(
     target_subdir: str = "original",
     classes: Sequence[str] | None = None,
     exclude_shots: bool = True,
+    per_class_limit: int | None = DEFAULT_PER_CLASS_LIMIT,
 ) -> DatasetBundle:
     data_root = Path(data_root)
     event_classes = list(classes) if classes is not None else discover_event_classes(data_root)
@@ -118,6 +124,8 @@ def build_dataset(
         target_paths = iter_image_paths(_image_source(event_root, target_subdir))
         if exclude_shots:
             target_paths = target_paths[shots_per_class:]
+        if per_class_limit is not None and per_class_limit > 0:
+            target_paths = target_paths[:per_class_limit]
 
         examples_by_class[event] = [
             FewShotImage(event=event, path=path, relative_path=_relative(path, data_root)) for path in example_paths
@@ -431,6 +439,7 @@ def forward(
     target_subdir: str = "original",
     class_chunk_size: int = DEFAULT_CLASS_CHUNK_SIZE,
     max_pixels: int = DEFAULT_MAX_PIXELS,
+    per_class_limit: int | None = DEFAULT_PER_CLASS_LIMIT,
     limit: int | None = None,
     progress: str = DEFAULT_PROGRESS,
     progress_stream: TextIO | None = None,
@@ -442,6 +451,7 @@ def forward(
         shots_per_class=shots_per_class,
         example_subdir=example_subdir,
         target_subdir=target_subdir,
+        per_class_limit=per_class_limit,
     )
     if resolved_progress == "text":
         _progress_write(
@@ -516,6 +526,7 @@ def forward(
         "shots_per_class": shots_per_class,
         "example_subdir": example_subdir,
         "target_subdir": target_subdir,
+        "per_class_limit": per_class_limit,
         "class_chunk_size": class_chunk_size,
         "max_pixels": max_pixels,
         "classes": dataset.classes,
@@ -541,6 +552,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-subdir", default="original")
     parser.add_argument("--class-chunk-size", type=int, default=DEFAULT_CLASS_CHUNK_SIZE)
     parser.add_argument("--max-pixels", type=int, default=DEFAULT_MAX_PIXELS)
+    parser.add_argument(
+        "--per-class-limit",
+        type=int,
+        default=DEFAULT_PER_CLASS_LIMIT,
+        help="Maximum target images to run per class after few-shot examples. Use 0 for no per-class limit.",
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--progress", choices=["auto", "tqdm", "text", "none"], default=DEFAULT_PROGRESS)
     return parser.parse_args()
@@ -557,6 +574,7 @@ def main() -> None:
         target_subdir=args.target_subdir,
         class_chunk_size=args.class_chunk_size,
         max_pixels=args.max_pixels,
+        per_class_limit=args.per_class_limit,
         limit=args.limit,
         progress=args.progress,
     )
