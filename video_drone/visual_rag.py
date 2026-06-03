@@ -32,6 +32,15 @@ DEFAULT_EXAMPLES_PER_EVENT = 3
 DEFAULT_TOP_K = 5
 DEFAULT_THRESHOLD = 0.35
 DEFAULT_MAX_PIXELS = 512 * 512
+DEFAULT_REGION_SIZE = 448
+DEFAULT_REGION_STRIDE = 336
+DEFAULT_REGION_MIN_SCORE = 0.82
+DEFAULT_REGION_MIN_MARGIN = 0.04
+DEFAULT_REGION_MIN_EXAMPLE_HITS = 2
+DEFAULT_MAX_REGIONS_PER_IMAGE = 96
+DEFAULT_QWEN_SCAN_MAX_REGIONS = 32
+DEFAULT_QWEN_SCAN_EXAMPLES_PER_EVENT = 5
+DEFAULT_QWEN_BATCH_SIZE = 4
 
 
 @dataclass(frozen=True)
@@ -42,6 +51,13 @@ class EvidenceExample:
     crop_path: Path | None = None
     crop_relative_path: str = ""
     red_box_found: bool = False
+
+
+@dataclass(frozen=True)
+class RegionProposal:
+    path: Path
+    relative_path: str
+    bbox: tuple[int, int, int, int]
 
 
 class ImageEmbedder(Protocol):
@@ -246,6 +262,17 @@ def event_rows_for_names(event_names: list[str]) -> list[dict]:
     return rows
 
 
+def group_examples_by_event(examples: list[EvidenceExample], event_names: list[str], examples_per_event: int) -> dict[str, list[EvidenceExample]]:
+    grouped: dict[str, list[EvidenceExample]] = {event: [] for event in event_names}
+    for example in examples:
+        if example.event not in grouped:
+            continue
+        if len(grouped[example.event]) >= examples_per_event:
+            continue
+        grouped[example.event].append(example)
+    return grouped
+
+
 def events_for_scope(scope: str, examples_root: Path) -> list[str] | None:
     if scope == "examples":
         return None
@@ -322,6 +349,80 @@ def independent_similarity_score(cosine: float) -> float:
     return round(max(0.0, min((float(cosine) + 1.0) / 2.0, 1.0)), 4)
 
 
+def _safe_stem(value: str) -> str:
+    stem = str(Path(value).with_suffix("")).replace("\\", "__").replace("/", "__")
+    return "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in stem)
+
+
+def _axis_starts(length: int, window: int, stride: int) -> list[int]:
+    if length <= window:
+        return [0]
+    starts = list(range(0, max(length - window, 0) + 1, max(stride, 1)))
+    last = length - window
+    if starts[-1] != last:
+        starts.append(last)
+    return starts
+
+
+def _save_region_crop(image: Image.Image, bbox: tuple[int, int, int, int], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.crop(bbox).save(path, quality=92)
+
+
+def generate_region_proposals(
+    image_path: Path,
+    region_root: Path,
+    sample_id: str,
+    region_size: int,
+    region_stride: int,
+    include_full_image: bool,
+    max_regions: int | None = None,
+) -> list[RegionProposal]:
+    region_root = region_root.resolve()
+    base = _safe_stem(sample_id)
+    proposals: list[RegionProposal] = []
+    with Image.open(image_path) as src:
+        image = src.convert("RGB")
+        width, height = image.size
+        if include_full_image:
+            rel = f"regions/{base}__full.jpg"
+            path = region_root / f"{base}__full.jpg"
+            bbox = (0, 0, width, height)
+            _save_region_crop(image, bbox, path)
+            proposals.append(RegionProposal(path=path, relative_path=rel, bbox=bbox))
+            if max_regions is not None and len(proposals) >= max_regions:
+                return proposals
+
+        size = max(1, int(region_size))
+        if width <= size and height <= size:
+            return proposals
+        tile_w = min(size, width)
+        tile_h = min(size, height)
+        for top in _axis_starts(height, tile_h, region_stride):
+            for left in _axis_starts(width, tile_w, region_stride):
+                bbox = (left, top, left + tile_w, top + tile_h)
+                if include_full_image and bbox == (0, 0, width, height):
+                    continue
+                rel = f"regions/{base}__x{left:04d}_y{top:04d}_w{tile_w}_h{tile_h}.jpg"
+                path = region_root / f"{base}__x{left:04d}_y{top:04d}_w{tile_w}_h{tile_h}.jpg"
+                _save_region_crop(image, bbox, path)
+                proposals.append(RegionProposal(path=path, relative_path=rel, bbox=bbox))
+                if max_regions is not None and len(proposals) >= max_regions:
+                    return proposals
+    return proposals
+
+
+def _example_payload(example: EvidenceExample, score: float) -> dict[str, Any]:
+    return {
+        "relative_path": evidence_relative_path(example),
+        "source_path": str(evidence_image_path(example)),
+        "original_relative_path": example.relative_path,
+        "original_source_path": str(example.path),
+        "red_box_found": example.red_box_found,
+        "score": score,
+    }
+
+
 def rank_event_candidates(
     query_embedding: np.ndarray,
     evidence_embeddings: np.ndarray,
@@ -344,19 +445,93 @@ def rank_event_candidates(
         bucket = by_event.setdefault(example.event, {"event": example.event, "score": 0.0, "examples": []})
         bucket["score"] = max(float(bucket["score"]), score)
         if len(bucket["examples"]) < examples_per_event:
-            bucket["examples"].append(
-                {
-                    "relative_path": evidence_relative_path(example),
-                    "source_path": str(evidence_image_path(example)),
-                    "original_relative_path": example.relative_path,
-                    "original_source_path": str(example.path),
-                    "red_box_found": example.red_box_found,
-                    "score": score,
-                }
-            )
+            bucket["examples"].append(_example_payload(example, score))
 
     candidates = list(by_event.values())
     candidates.sort(key=lambda item: (-float(item["score"]), item["event"]))
+    return candidates[:top_events]
+
+
+def _rank_events_for_region(
+    region_index: int,
+    similarities: np.ndarray,
+    examples: list[EvidenceExample],
+    top_examples: int,
+    examples_per_event: int,
+    min_example_hits: int,
+) -> list[dict]:
+    ranked_indices = np.argsort(-similarities)[:top_examples]
+    by_event: dict[str, list[tuple[EvidenceExample, float]]] = {}
+    for idx in ranked_indices:
+        example = examples[int(idx)]
+        score = independent_similarity_score(float(similarities[int(idx)]))
+        by_event.setdefault(example.event, []).append((example, score))
+
+    events = []
+    for event, hits in by_event.items():
+        hits.sort(key=lambda item: item[1], reverse=True)
+        selected = hits[:examples_per_event]
+        if len(selected) < min_example_hits:
+            continue
+        scored_hits = selected[:max(min_example_hits, 1)]
+        score = round(sum(item[1] for item in scored_hits) / len(scored_hits), 4)
+        events.append(
+            {
+                "event": event,
+                "score": score,
+                "region_index": region_index,
+                "example_hits": len(selected),
+                "examples": [_example_payload(example, hit_score) for example, hit_score in selected],
+            }
+        )
+    events.sort(key=lambda item: (-float(item["score"]), item["event"]))
+    return events
+
+
+def rank_region_event_candidates(
+    region_embeddings: np.ndarray,
+    regions: list[RegionProposal],
+    evidence_embeddings: np.ndarray,
+    examples: list[EvidenceExample],
+    top_examples: int,
+    top_events: int,
+    examples_per_event: int,
+    min_score: float,
+    min_margin: float,
+    min_example_hits: int,
+) -> list[dict]:
+    if not regions or len(examples) == 0:
+        return []
+    evidence = _normalize_matrix(evidence_embeddings)
+    query = _normalize_matrix(region_embeddings)
+    all_similarities = query @ evidence.T
+    by_event: dict[str, dict] = {}
+
+    for region_idx, region in enumerate(regions):
+        ranked_events = _rank_events_for_region(region_idx, all_similarities[region_idx], examples, top_examples, examples_per_event, min_example_hits)
+        if not ranked_events:
+            continue
+        best = ranked_events[0]
+        runner_up = ranked_events[1]["score"] if len(ranked_events) > 1 else 0.0
+        margin = round(float(best["score"]) - float(runner_up), 4)
+        if float(best["score"]) < min_score or margin < min_margin:
+            continue
+        candidate = {
+            "event": best["event"],
+            "score": best["score"],
+            "margin": margin,
+            "region_relative_path": region.relative_path,
+            "region_source_path": str(region.path),
+            "region_bbox": list(region.bbox),
+            "example_hits": best["example_hits"],
+            "examples": best["examples"],
+        }
+        previous = by_event.get(str(best["event"]))
+        if previous is None or float(candidate["score"]) > float(previous["score"]):
+            by_event[str(best["event"])] = candidate
+
+    candidates = list(by_event.values())
+    candidates.sort(key=lambda item: (-float(item["score"]), -float(item["margin"]), item["event"]))
     return candidates[:top_events]
 
 
@@ -455,6 +630,101 @@ def parse_visual_rag_json(text: str, candidate_events: list[str], top_k: int) ->
     }
 
 
+def build_region_verify_prompt(event_row: dict, candidate: dict) -> str:
+    event = candidate["event"]
+    examples = "、".join(str(item.get("relative_path", "")) for item in candidate.get("examples", []))
+    return f"""你是无人机巡检图像的城市治理事件识别助手。输入中前面的图片是“{event}”的红框 object 示例，最后一张图片是从待测图像中裁剪出的候选区域。
+
+任务:
+- 只判断最后一张候选区域，不要判断整张原图，也不要把示例图里的事件当作结果。
+- 只有候选区域中清楚可见“{event}”的关键 object / region / 状态时，has_event 才能为 true。
+- 如果只是背景、颜色、道路、农田、水面、屋顶、拍摄角度相似，但缺少关键 object，必须判 false，score 不得超过 0.3。
+- 如果候选区域太模糊、太小、被遮挡、证据不足，必须判 false。
+
+事件定义:
+- 事件: {event}
+- 定义: {event_row.get('definition', '')}
+- 正例: {event_row.get('positive', '')}
+- 反例: {event_row.get('negative', '')}
+
+检索信息:
+- region_bbox: {candidate.get('region_bbox', [])}
+- region_similarity_score: {candidate.get('score', 0.0)}
+- margin_to_next_event: {candidate.get('margin', 0.0)}
+- matched_redbox_examples: {examples}
+
+要求:
+- 只输出一个 JSON 对象，不要输出 Markdown、解释性前后缀或代码块。
+- evidence 必须描述最后一张候选区域中实际可见的视觉证据，不能引用示例图作为证据。
+
+JSON 格式:
+{{
+  "has_event": false,
+  "event": "{event}",
+  "score": 0.0,
+  "caption": "一句候选区域描述",
+  "evidence": "一句判断依据"
+}}"""
+
+
+def build_qwen_region_scan_prompt(event_row: dict, example_count: int, region_bbox: tuple[int, int, int, int]) -> str:
+    event = event_row["event"]
+    return f"""你是无人机巡检图像的城市治理事件识别助手。输入中前面最多 {example_count} 张红框 object 示例是“{event}”的视觉标准，最后一张图片是从待测图像中裁剪出的候选区域。
+
+任务:
+- 只判断最后一张候选区域，不要判断整张原图，也不要把示例图里的事件当作结果。
+- 前面的示例图只用于理解“{event}”的关键 object / region / 状态；红框外背景不代表事件。
+- 只有候选区域中清楚可见与示例红框内部同类的关键 object / region / 状态时，has_event 才能为 true。
+- 如果只是背景、颜色、道路、农田、水面、屋顶、拍摄角度相似，但缺少关键 object，必须判 false，score 不得超过 0.3。
+- 如果候选区域太模糊、太小、被遮挡、证据不足，必须判 false。
+
+事件定义:
+- 事件: {event}
+- 定义: {event_row.get('definition', '')}
+- 正例: {event_row.get('positive', '')}
+- 反例: {event_row.get('negative', '')}
+
+候选区域:
+- region_bbox: {list(region_bbox)}
+
+要求:
+- 只输出一个 JSON 对象，不要输出 Markdown、解释性前后缀或代码块。
+- evidence 必须描述最后一张候选区域中实际可见的视觉证据，不能引用示例图作为证据。
+
+JSON 格式:
+{{
+  "has_event": false,
+  "event": "{event}",
+  "score": 0.0,
+  "caption": "一句候选区域描述",
+  "evidence": "一句判断依据"
+}}"""
+
+
+def parse_region_verify_json(text: str, event_name: str) -> dict:
+    raw = text.strip()
+    try:
+        data = _extract_json_object(raw)
+        parse_error = ""
+    except Exception as exc:
+        data = {}
+        parse_error = str(exc)
+    has_event = data.get("has_event")
+    if not isinstance(has_event, bool):
+        has_event = data.get("has_relevant_event")
+    if not isinstance(has_event, bool):
+        has_event = False
+    return {
+        "event": event_name,
+        "has_event": bool(has_event),
+        "score": round(_score(data.get("score", 0.0)), 4),
+        "caption": str(data.get("caption") or "").strip(),
+        "evidence": str(data.get("evidence") or "").strip(),
+        "raw_response": raw,
+        "parse_error": parse_error,
+    }
+
+
 def resolve_embedding_model_path(model: str | None, cache_dir: Path) -> Path | str:
     model_id = model or DEFAULT_EMBEDDING_MODEL_ID
     path = Path(model_id)
@@ -467,6 +737,13 @@ def resolve_embedding_model_path(model: str | None, cache_dir: Path) -> Path | s
         return path
     cached = _model_snapshot_from_cache(model_id, cache_dir)
     return cached if cached is not None else model_id
+
+
+def configure_generation_processor_padding(processor):
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is not None and hasattr(tokenizer, "padding_side"):
+        tokenizer.padding_side = "left"
+    return processor
 
 
 class ClipImageEmbedder:
@@ -602,7 +879,7 @@ class QwenVisualRagVerifier:
         if self.device != "auto":
             self.model.to(self.device)
         self.model.eval()
-        self.processor = AutoProcessor.from_pretrained(self.model_path, local_files_only=True)
+        self.processor = configure_generation_processor_padding(AutoProcessor.from_pretrained(self.model_path, local_files_only=True))
 
     def verify(self, target_image_path: Path, examples: list[EvidenceExample], prompt: str) -> str:
         import torch
@@ -619,7 +896,7 @@ class QwenVisualRagVerifier:
         except ModuleNotFoundError:
             images = []
             for example in examples:
-                with Image.open(example.path) as img:
+                with Image.open(evidence_image_path(example)) as img:
                     images.append(img.convert("RGB"))
             with Image.open(target_image_path) as img:
                 images.append(img.convert("RGB"))
@@ -628,7 +905,48 @@ class QwenVisualRagVerifier:
         with torch.inference_mode():
             generated = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
         generated = generated[:, inputs.input_ids.shape[1] :]
-        return self.processor.batch_decode(generated, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        output = self.processor.batch_decode(generated, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return output
+
+    def verify_batch(self, requests: list[dict[str, Any]]) -> list[str]:
+        import torch
+
+        if self.model is None or self.processor is None:
+            self.load()
+        messages_list = [
+            build_qwen_visual_rag_messages(
+                request["examples"],
+                Path(request["target_image_path"]),
+                str(request["prompt"]),
+                self.max_pixels,
+            )
+            for request in requests
+        ]
+        texts = [self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) for messages in messages_list]
+        try:
+            from qwen_vl_utils import process_vision_info
+
+            image_inputs, video_inputs = process_vision_info(messages_list)
+            inputs = self.processor(text=texts, images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
+        except ModuleNotFoundError:
+            images = []
+            for request in requests:
+                for example in request["examples"]:
+                    with Image.open(evidence_image_path(example)) as img:
+                        images.append(img.convert("RGB"))
+                with Image.open(Path(request["target_image_path"])) as img:
+                    images.append(img.convert("RGB"))
+            inputs = self.processor(text=texts, images=images, return_tensors="pt", padding=True)
+        inputs = inputs.to(self.model.device)
+        with torch.inference_mode():
+            generated = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
+        generated = generated[:, inputs.input_ids.shape[1] :]
+        outputs = self.processor.batch_decode(generated, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return outputs
 
 
 def build_evidence_index(embedder: ImageEmbedder, examples: list[EvidenceExample]) -> np.ndarray:
@@ -659,6 +977,68 @@ def predict_records_retrieve_only(
                 "has_relevant_event": bool(predicted),
                 "predicted_events": predicted,
                 "retrieved_candidates": candidates,
+                "caption": "",
+                "evidence": "",
+                "raw_response": "",
+                "error": "",
+            }
+        )
+    return output
+
+
+def predict_records_region_retrieve(
+    records: list[dict],
+    embedder: ImageEmbedder,
+    examples: list[EvidenceExample],
+    event_rows: list[dict],
+    top_examples: int,
+    candidate_events: int,
+    examples_per_event: int,
+    top_k: int,
+    region_root: Path,
+    region_size: int,
+    region_stride: int,
+    include_full_region: bool,
+    min_score: float,
+    min_margin: float,
+    min_example_hits: int,
+    max_regions_per_image: int | None,
+) -> list[dict]:
+    evidence_embeddings = build_evidence_index(embedder, examples)
+    output = []
+    for idx, rec in enumerate(records, 1):
+        print(f"[{idx}/{len(records)}] {rec['relative_path']}")
+        regions = generate_region_proposals(
+            Path(rec["source_path"]),
+            region_root,
+            str(rec.get("sample_id") or rec["relative_path"]),
+            region_size,
+            region_stride,
+            include_full_region,
+            max_regions_per_image,
+        )
+        region_embeddings = embedder.embed_image_paths([region.path for region in regions])
+        candidates = rank_region_event_candidates(
+            region_embeddings,
+            regions,
+            evidence_embeddings,
+            examples,
+            top_examples,
+            candidate_events,
+            examples_per_event,
+            min_score,
+            min_margin,
+            min_example_hits,
+        )
+        predicted = [{"event": item["event"], "score": item["score"]} for item in candidates[:top_k]]
+        output.append(
+            {
+                **rec,
+                "method": "visual-rag-region-retrieve",
+                "has_relevant_event": bool(predicted),
+                "predicted_events": predicted,
+                "retrieved_candidates": candidates,
+                "region_count": len(regions),
                 "caption": "",
                 "evidence": "",
                 "raw_response": "",
@@ -718,6 +1098,234 @@ def predict_records_verify(
     return output
 
 
+def predict_records_region_verify(
+    records: list[dict],
+    embedder: ImageEmbedder,
+    verifier: QwenVisualRagVerifier,
+    examples: list[EvidenceExample],
+    event_rows: list[dict],
+    top_examples: int,
+    candidate_events: int,
+    examples_per_event: int,
+    top_k: int,
+    threshold: float,
+    region_root: Path,
+    region_size: int,
+    region_stride: int,
+    include_full_region: bool,
+    min_score: float,
+    min_margin: float,
+    min_example_hits: int,
+    max_regions_per_image: int | None,
+) -> list[dict]:
+    evidence_embeddings = build_evidence_index(embedder, examples)
+    row_by_event = {row["event"]: row for row in event_rows}
+    output = []
+    for idx, rec in enumerate(records, 1):
+        print(f"[{idx}/{len(records)}] {rec['relative_path']}")
+        candidates: list[dict] = []
+        checks = []
+        errors = []
+        try:
+            regions = generate_region_proposals(
+                Path(rec["source_path"]),
+                region_root,
+                str(rec.get("sample_id") or rec["relative_path"]),
+                region_size,
+                region_stride,
+                include_full_region,
+                max_regions_per_image,
+            )
+            region_embeddings = embedder.embed_image_paths([region.path for region in regions])
+            candidates = rank_region_event_candidates(
+                region_embeddings,
+                regions,
+                evidence_embeddings,
+                examples,
+                top_examples,
+                candidate_events,
+                examples_per_event,
+                min_score,
+                min_margin,
+                min_example_hits,
+            )
+            positives = []
+            for candidate in candidates[:top_k]:
+                event = str(candidate["event"])
+                prompt = build_region_verify_prompt(row_by_event.get(event) or event_rows_for_names([event])[0], candidate)
+                raw = verifier.verify(Path(candidate["region_source_path"]), _candidate_examples([candidate]), prompt)
+                parsed = parse_region_verify_json(raw, event)
+                error = parsed.pop("parse_error", "")
+                check = {**candidate, **parsed, "error": error}
+                checks.append(check)
+                if error:
+                    errors.append(f"{event}: {error}")
+                if check["has_event"] and float(check["score"]) >= threshold:
+                    positives.append(
+                        {
+                            "event": event,
+                            "score": check["score"],
+                            "region_bbox": candidate.get("region_bbox", []),
+                            "region_relative_path": candidate.get("region_relative_path", ""),
+                        }
+                    )
+            positives.sort(key=lambda item: item["score"], reverse=True)
+            parsed_output = {
+                "has_relevant_event": bool(positives),
+                "predicted_events": positives[:top_k],
+                "caption": checks[0].get("caption", "") if checks else "",
+                "evidence": next((check.get("evidence", "") for check in checks if check.get("has_event")), ""),
+                "raw_response": json.dumps(checks, ensure_ascii=False),
+            }
+        except Exception as exc:
+            if is_fatal_inference_error(exc):
+                raise RuntimeError(f"Fatal region visual-RAG inference error at {rec['relative_path']}: {exc}") from exc
+            parsed_output = {
+                "has_relevant_event": False,
+                "predicted_events": [],
+                "caption": "",
+                "evidence": "",
+                "raw_response": "",
+            }
+            errors.append(str(exc))
+        output.append(
+            {
+                **rec,
+                "method": "visual-rag-region-qwen-verify",
+                "retrieved_candidates": candidates,
+                "region_verify_checks": checks,
+                **parsed_output,
+                "error": " | ".join(errors),
+            }
+        )
+    return output
+
+
+def predict_records_qwen_region_scan(
+    records: list[dict],
+    verifier: QwenVisualRagVerifier,
+    examples: list[EvidenceExample],
+    event_rows: list[dict],
+    examples_per_event: int,
+    top_k: int,
+    threshold: float,
+    region_root: Path,
+    region_size: int,
+    region_stride: int,
+    include_full_region: bool,
+    max_regions_per_image: int | None,
+    qwen_batch_size: int = 1,
+) -> list[dict]:
+    event_names = [row["event"] for row in event_rows]
+    examples_by_event = group_examples_by_event(examples, event_names, examples_per_event)
+    output = []
+    for idx, rec in enumerate(records, 1):
+        print(f"[{idx}/{len(records)}] {rec['relative_path']}")
+        checks = []
+        errors = []
+        positives_by_event: dict[str, dict] = {}
+        try:
+            regions = generate_region_proposals(
+                Path(rec["source_path"]),
+                region_root,
+                str(rec.get("sample_id") or rec["relative_path"]),
+                region_size,
+                region_stride,
+                include_full_region,
+                max_regions_per_image,
+            )
+            requests = []
+            for row in event_rows:
+                event = row["event"]
+                event_examples = examples_by_event.get(event, [])
+                for region in regions:
+                    prompt = build_qwen_region_scan_prompt(row, len(event_examples), region.bbox)
+                    requests.append(
+                        {
+                            "event": event,
+                            "row": row,
+                            "region": region,
+                            "examples": event_examples,
+                            "prompt": prompt,
+                            "target_image_path": region.path,
+                        }
+                    )
+
+            batch_size = max(1, int(qwen_batch_size))
+            for start in range(0, len(requests), batch_size):
+                batch = requests[start : start + batch_size]
+                if hasattr(verifier, "verify_batch"):
+                    raw_outputs = verifier.verify_batch(batch)
+                else:
+                    raw_outputs = [
+                        verifier.verify(Path(request["target_image_path"]), request["examples"], request["prompt"])
+                        for request in batch
+                    ]
+                if len(raw_outputs) != len(batch):
+                    raise RuntimeError(f"Batch verifier returned {len(raw_outputs)} outputs for {len(batch)} requests.")
+                for request, raw in zip(batch, raw_outputs):
+                    event = str(request["event"])
+                    region = request["region"]
+                    event_examples = request["examples"]
+                    parsed = parse_region_verify_json(raw, event)
+                    error = parsed.pop("parse_error", "")
+                    check = {
+                        **parsed,
+                        "region_bbox": list(region.bbox),
+                        "region_relative_path": region.relative_path,
+                        "region_source_path": str(region.path),
+                        "example_count": len(event_examples),
+                        "example_paths": [evidence_relative_path(example) for example in event_examples],
+                        "error": error,
+                    }
+                    checks.append(check)
+                    if error:
+                        errors.append(f"{event} {region.relative_path}: {error}")
+                    if check["has_event"] and float(check["score"]) >= threshold:
+                        previous = positives_by_event.get(event)
+                        if previous is None or float(check["score"]) > float(previous["score"]):
+                            positives_by_event[event] = {
+                                "event": event,
+                                "score": check["score"],
+                                "region_bbox": check["region_bbox"],
+                                "region_relative_path": check["region_relative_path"],
+                            }
+            predicted = list(positives_by_event.values())
+            predicted.sort(key=lambda item: item["score"], reverse=True)
+            first_positive = next((check for check in checks if check.get("has_event") and float(check.get("score", 0.0)) >= threshold), {})
+            parsed_output = {
+                "has_relevant_event": bool(predicted),
+                "predicted_events": predicted[:top_k],
+                "caption": str(first_positive.get("caption") or ""),
+                "evidence": str(first_positive.get("evidence") or ""),
+                "raw_response": json.dumps(checks, ensure_ascii=False),
+                "region_count": len(regions),
+            }
+        except Exception as exc:
+            if is_fatal_inference_error(exc):
+                raise RuntimeError(f"Fatal Qwen region-scan inference error at {rec['relative_path']}: {exc}") from exc
+            parsed_output = {
+                "has_relevant_event": False,
+                "predicted_events": [],
+                "caption": "",
+                "evidence": "",
+                "raw_response": "",
+                "region_count": 0,
+            }
+            errors.append(str(exc))
+        output.append(
+            {
+                **rec,
+                "method": "qwen-region-scan",
+                "retrieved_candidates": [],
+                "event_region_checks": checks,
+                **parsed_output,
+                "error": " | ".join(errors),
+            }
+        )
+    return output
+
+
 def write_outputs(records: list[dict], out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = out_dir / "visual_rag_predictions.jsonl"
@@ -734,6 +1342,8 @@ def write_outputs(records: list[dict], out_dir: Path) -> None:
         "hit_top1",
         "retrieved_top1",
         "retrieved_top1_score",
+        "retrieved_region",
+        "retrieved_region_bbox",
         "retrieved_examples",
         "has_relevant_event",
         "caption",
@@ -748,6 +1358,8 @@ def write_outputs(records: list[dict], out_dir: Path) -> None:
             top1 = rec.get("predicted_events", [{}])[0] if rec.get("predicted_events") else {}
             retrieved = rec.get("retrieved_candidates", [{}])[0] if rec.get("retrieved_candidates") else {}
             retrieved_examples = " | ".join(str(item.get("relative_path", "")) for item in retrieved.get("examples", []))
+            region_rel = retrieved.get("region_relative_path", "") or top1.get("region_relative_path", "")
+            region_bbox = retrieved.get("region_bbox", []) or top1.get("region_bbox", [])
             writer.writerow(
                 {
                     "sample_id": rec.get("sample_id", ""),
@@ -757,6 +1369,8 @@ def write_outputs(records: list[dict], out_dir: Path) -> None:
                     "hit_top1": top1.get("event") == rec.get("ground_truth_event"),
                     "retrieved_top1": retrieved.get("event", ""),
                     "retrieved_top1_score": retrieved.get("score", ""),
+                    "retrieved_region": region_rel,
+                    "retrieved_region_bbox": json.dumps(region_bbox, ensure_ascii=False),
                     "retrieved_examples": retrieved_examples,
                     "has_relevant_event": rec.get("has_relevant_event", False),
                     "caption": rec.get("caption", ""),
@@ -847,7 +1461,7 @@ def main() -> None:
     parser.add_argument("--data-root", default=DEFAULT_DATA_ROOT, type=Path)
     parser.add_argument("--examples-root", default=DEFAULT_EXAMPLES_ROOT, type=Path)
     parser.add_argument("--out-dir", default=Path("outputs/visual_rag"), type=Path)
-    parser.add_argument("--mode", default=DEFAULT_MODE, choices=["retrieve-only", "verify"])
+    parser.add_argument("--mode", default=DEFAULT_MODE, choices=["retrieve-only", "verify", "region-retrieve", "region-verify", "qwen-region-scan"])
     parser.add_argument("--event-scope", default="examples", choices=["examples", "primary", "taxonomy"])
     parser.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL_ID)
     parser.add_argument("--verify-model", default=DEFAULT_VERIFY_MODEL_ID)
@@ -858,6 +1472,16 @@ def main() -> None:
     parser.add_argument("--examples-per-event", default=DEFAULT_EXAMPLES_PER_EVENT, type=int)
     parser.add_argument("--red-box-mode", default="auto", choices=["auto", "off", "require"], help="Use red rectangle crops from exemplar images. auto falls back to full images when no box is found.")
     parser.add_argument("--red-box-inset", default=2, type=int, help="Pixels to trim inward from the detected red rectangle before cropping.")
+    parser.add_argument("--region-size", default=DEFAULT_REGION_SIZE, type=int)
+    parser.add_argument("--region-stride", default=DEFAULT_REGION_STRIDE, type=int)
+    parser.add_argument("--no-full-region", action="store_true", help="Do not include the full target image as an extra region proposal.")
+    parser.add_argument("--region-min-score", default=DEFAULT_REGION_MIN_SCORE, type=float)
+    parser.add_argument("--region-min-margin", default=DEFAULT_REGION_MIN_MARGIN, type=float)
+    parser.add_argument("--region-min-example-hits", default=DEFAULT_REGION_MIN_EXAMPLE_HITS, type=int)
+    parser.add_argument("--max-regions-per-image", default=DEFAULT_MAX_REGIONS_PER_IMAGE, type=int, help="Cap generated target regions per image to limit runtime and memory. Use 0 for no cap.")
+    parser.add_argument("--qwen-scan-max-regions", default=DEFAULT_QWEN_SCAN_MAX_REGIONS, type=int, help="Qwen-only scan region cap per image.")
+    parser.add_argument("--qwen-scan-examples-per-event", default=DEFAULT_QWEN_SCAN_EXAMPLES_PER_EVENT, type=int, help="Qwen-only scan redbox examples per event.")
+    parser.add_argument("--qwen-batch-size", default=DEFAULT_QWEN_BATCH_SIZE, type=int, help="Batch size for Qwen region scan generation. Lower this if CUDA OOM occurs.")
     parser.add_argument("--top-examples", default=DEFAULT_TOP_EXAMPLES, type=int)
     parser.add_argument("--candidate-events", default=DEFAULT_CANDIDATE_EVENTS, type=int)
     parser.add_argument("--top-k", default=DEFAULT_TOP_K, type=int)
@@ -872,6 +1496,8 @@ def main() -> None:
     args = parser.parse_args()
 
     requested_events = events_for_scope(args.event_scope, args.examples_root)
+    if args.mode == "qwen-region-scan":
+        requested_events = [row["event"] for row in EVENT_TAXONOMY if row["event"] in PRIMARY_EVENTS]
     examples = load_evidence_examples(args.examples_root, requested_events, args.index_examples_per_event)
     if not examples:
         raise RuntimeError(f"No evidence examples found under {args.examples_root}")
@@ -879,19 +1505,21 @@ def main() -> None:
     if not examples:
         raise RuntimeError(f"No evidence examples remained after red-box preparation under {args.examples_root}")
     event_names = requested_events if requested_events is not None else unique_events_from_examples(examples)
-    event_names = [event for event in event_names if any(example.event == event for example in examples)]
+    if args.mode != "qwen-region-scan":
+        event_names = [event for event in event_names if any(example.event == event for example in examples)]
     event_rows = event_rows_for_names(event_names)
     records = iter_image_records_for_events(args.data_root, event_names, args.examples_root, args.per_class_limit, args.limit)
     if not records:
         raise RuntimeError(f"No evaluation images found under {args.data_root} for events: {', '.join(event_names)}")
 
-    embedding_model_path = resolve_embedding_model_path(args.embedding_model, args.hf_cache)
-    print(f"Embedding model: {embedding_model_path}")
     print(f"Evidence examples: {len(examples)} across {len(event_names)} events")
     print(f"Images: {len(records)}")
-    embedder = ClipImageEmbedder(embedding_model_path, device=args.embed_device, dtype=args.embed_dtype, batch_size=args.batch_size)
+    max_regions_per_image = None if args.max_regions_per_image is not None and args.max_regions_per_image <= 0 else args.max_regions_per_image
 
     if args.mode == "retrieve-only":
+        embedding_model_path = resolve_embedding_model_path(args.embedding_model, args.hf_cache)
+        print(f"Embedding model: {embedding_model_path}")
+        embedder = ClipImageEmbedder(embedding_model_path, device=args.embed_device, dtype=args.embed_dtype, batch_size=args.batch_size)
         predictions = predict_records_retrieve_only(
             records,
             embedder,
@@ -902,7 +1530,36 @@ def main() -> None:
             args.examples_per_event,
             args.top_k,
         )
-    else:
+    elif args.mode == "region-retrieve":
+        embedding_model_path = resolve_embedding_model_path(args.embedding_model, args.hf_cache)
+        print(f"Embedding model: {embedding_model_path}")
+        embedder = ClipImageEmbedder(embedding_model_path, device=args.embed_device, dtype=args.embed_dtype, batch_size=args.batch_size)
+        predictions = predict_records_region_retrieve(
+            records,
+            embedder,
+            examples,
+            event_rows,
+            args.top_examples,
+            args.candidate_events,
+            args.examples_per_event,
+            args.top_k,
+            args.out_dir / "regions",
+            args.region_size,
+            args.region_stride,
+            not args.no_full_region,
+            args.region_min_score,
+            args.region_min_margin,
+            args.region_min_example_hits,
+            max_regions_per_image,
+        )
+    elif args.mode == "verify":
+        embedding_model_path = resolve_embedding_model_path(args.embedding_model, args.hf_cache)
+        print(f"Embedding model: {embedding_model_path}")
+        embed_device = args.embed_device
+        if embed_device == "auto":
+            embed_device = "cpu"
+            print("Embedding device: cpu (auto-selected for verify mode to leave GPU memory for Qwen)")
+        embedder = ClipImageEmbedder(embedding_model_path, device=embed_device, dtype=args.embed_dtype, batch_size=args.batch_size)
         verify_model_path = resolve_model_path(args.verify_model, args.hf_cache)
         print(f"Verifier model: {verify_model_path}")
         verifier = QwenVisualRagVerifier(verify_model_path, args.device, args.dtype, args.max_new_tokens, args.max_pixels)
@@ -917,6 +1574,57 @@ def main() -> None:
             args.examples_per_event,
             args.top_k,
             args.threshold,
+        )
+    elif args.mode == "region-verify":
+        embedding_model_path = resolve_embedding_model_path(args.embedding_model, args.hf_cache)
+        print(f"Embedding model: {embedding_model_path}")
+        embed_device = args.embed_device
+        if embed_device == "auto":
+            embed_device = "cpu"
+            print("Embedding device: cpu (auto-selected for verify mode to leave GPU memory for Qwen)")
+        embedder = ClipImageEmbedder(embedding_model_path, device=embed_device, dtype=args.embed_dtype, batch_size=args.batch_size)
+        verify_model_path = resolve_model_path(args.verify_model, args.hf_cache)
+        print(f"Verifier model: {verify_model_path}")
+        verifier = QwenVisualRagVerifier(verify_model_path, args.device, args.dtype, args.max_new_tokens, args.max_pixels)
+        predictions = predict_records_region_verify(
+            records,
+            embedder,
+            verifier,
+            examples,
+            event_rows,
+            args.top_examples,
+            args.candidate_events,
+            args.examples_per_event,
+            args.top_k,
+            args.threshold,
+            args.out_dir / "regions",
+            args.region_size,
+            args.region_stride,
+            not args.no_full_region,
+            args.region_min_score,
+            args.region_min_margin,
+            args.region_min_example_hits,
+            max_regions_per_image,
+        )
+    else:
+        verify_model_path = resolve_model_path(args.verify_model, args.hf_cache)
+        print(f"Verifier model: {verify_model_path}")
+        verifier = QwenVisualRagVerifier(verify_model_path, args.device, args.dtype, args.max_new_tokens, args.max_pixels)
+        scan_max_regions = None if args.qwen_scan_max_regions is not None and args.qwen_scan_max_regions <= 0 else args.qwen_scan_max_regions
+        predictions = predict_records_qwen_region_scan(
+            records,
+            verifier,
+            examples,
+            event_rows,
+            args.qwen_scan_examples_per_event,
+            args.top_k,
+            args.threshold,
+            args.out_dir / "regions",
+            args.region_size,
+            args.region_stride,
+            not args.no_full_region,
+            scan_max_regions,
+            args.qwen_batch_size,
         )
 
     write_outputs(predictions, args.out_dir)

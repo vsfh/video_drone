@@ -515,6 +515,13 @@ def resolve_model_path(model: str | None, cache_dir: Path) -> Path | str:
     return cached if cached is not None else model_id
 
 
+def _configure_generation_processor_padding(processor):
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is not None and hasattr(tokenizer, "padding_side"):
+        tokenizer.padding_side = "left"
+    return processor
+
+
 class FewShotVLMClassifier:
     def __init__(
         self,
@@ -565,7 +572,7 @@ class FewShotVLMClassifier:
         if self.device != "auto":
             self.model.to(self.device)
         self.model.eval()
-        self.processor = AutoProcessor.from_pretrained(self.model_path, local_files_only=True)
+        self.processor = _configure_generation_processor_padding(AutoProcessor.from_pretrained(self.model_path, local_files_only=True))
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
