@@ -42,6 +42,10 @@ AUTO_RESEARCH_CHANGELOG = [
     {
         "time": "2026-06-03 13:50:00",
         "summary": "Limit inference to at most N target images per class, defaulting to 5.",
+    },
+    {
+        "time": "2026-06-03 14:05:00",
+        "summary": "Continue experiments when the VLM returns malformed JSON, recording parse_error instead of crashing.",
     }
 ]
 
@@ -239,11 +243,15 @@ def _extract_json_object(text: str) -> dict[str, Any]:
         text = re.sub(r"```$", "", text).strip()
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as first_error:
         start = text.find("{")
         end = text.rfind("}")
         if start >= 0 and end > start:
-            return json.loads(text[start : end + 1])
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError as second_error:
+                return {"_parse_error": f"{second_error.msg}: line {second_error.lineno} column {second_error.colno}"}
+        return {"_parse_error": f"{first_error.msg}: line {first_error.lineno} column {first_error.colno}"}
     return {}
 
 
@@ -283,6 +291,7 @@ def parse_prediction_json(text: str, classes: Sequence[str], default_event: str 
         "caption": str(payload.get("caption", "") or ""),
         "evidence": str(payload.get("evidence", "") or ""),
         "raw_response": text,
+        **({"parse_error": payload["_parse_error"]} if payload.get("_parse_error") else {}),
     }
 
 
